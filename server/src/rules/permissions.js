@@ -1,0 +1,199 @@
+"use strict";
+
+/**
+ * Role-to-operation matrix. REQ-7, REQ-8, REQ-10, BR-10.
+ *
+ * This is the authority. The web app holds a copy of the same map to decide
+ * what to render, but that copy is a convenience for the interface and carries
+ * no weight: every request is evaluated here, server-side, against the role the
+ * actor holds IN THE CURRENTLY ACTIVE CLUB (REQ-8). A user who is Treasurer of
+ * one club and an ordinary Member of another gets treasurer permissions only
+ * while the first club is the active context.
+ *
+ * Pure data and pure functions. No database, no Express, no session. It can be
+ * tested exhaustively without starting anything.
+ */
+
+const MATRIX = {
+  Member: [
+    "view.governance",
+    "view.dashboard",
+    "view.ownStatement",
+    "view.queue",
+    "view.constitution",
+    "view.pool",
+    "claim.lodge",
+    "assistant.ask",
+    "queue.requestSwap",
+    "queue.consentSwap",
+    // REQ-37. A member records and can end cover for their own dependants.
+    "dependant.manage",
+  ],
+  Treasurer: [
+    "view.governance",
+    "view.dashboard",
+    "view.ownStatement",
+    "view.queue",
+    "view.constitution",
+    "view.pool",
+    "view.ledger",
+    "view.members",
+    "view.reconciliation",
+    "cycle.open",
+    "cycle.close",
+    "contribution.capture",
+    "payout.view",
+    "payout.initiate",
+    "payout.cancel",
+    "ledger.reverse",
+    "reconciliation.record",
+    "claim.lodge",
+    "assistant.ask",
+    "queue.requestSwap",
+    "queue.consentSwap",
+    // REQ-79, REQ-80. The Treasurer initiates a year-end distribution and
+    // records the interest and administrative costs it depends on, the
+    // same way they capture contributions and levy penalties as they
+    // occur.
+    "distribution.view",
+    "distribution.initiate",
+    "distribution.cancel",
+    "distribution.recordFinancials",
+    // REQ-83 to REQ-88, Use Case 4. The Treasurer starts paying a lodged
+    // claim, the same role that initiates any other payout.
+    "claim.view",
+    "claim.initiate",
+    "claim.cancel",
+    "dependant.manage",
+  ],
+  Secretary: [
+    "view.governance",
+    "view.dashboard",
+    "view.ownStatement",
+    "view.queue",
+    "view.constitution",
+    "view.pool",
+    "view.members",
+    "view.ledger",
+    "member.register",
+    "member.amend",
+    "member.revealId",
+    "member.assignRole",
+    "governance.record",
+    "assistant.ask",
+    "payout.view",
+    "queue.requestSwap",
+    "queue.consentSwap",
+    "distribution.view",
+    "claim.view",
+    "dependant.manage",
+  ],
+  Chairperson: [
+    "view.governance",
+    "view.dashboard",
+    "view.ownStatement",
+    "view.queue",
+    "view.constitution",
+    "view.pool",
+    "view.ledger",
+    "view.members",
+    "view.reconciliation",
+    "payout.view",
+    "payout.approve",
+    "payout.assess",
+    "penalty.waive",
+    "ledger.reverseApprove",
+    // REQ-82. The Chairperson approves a year-end distribution the same
+    // way they approve any other payout.
+    "distribution.view",
+    "distribution.approve",
+    // REQ-64, REQ-88. The Chairperson approves a claim's payment the same
+    // way they approve any other payout.
+    "claim.view",
+    "claim.approve",
+    "dependant.manage",
+    // Use Case 3. The Chairperson approves payouts and exchanges of
+    // position, rules on a member in arrears at the head of the queue
+    // (REQ-77) and runs the draw that sets the order (REQ-71). Requesting
+    // and consenting to an exchange belong to every member.
+    "queue.approveSwap",
+    "queue.resolveArrears",
+    "queue.establish",
+    "queue.requestSwap",
+    "queue.consentSwap",
+    // REQ-43 names the Secretary AND the Chairperson for all three of
+    // these. An earlier version of this matrix gave register and amend to
+    // the Secretary alone, which was a defect against the requirement.
+    "member.register",
+    "member.amend",
+    "member.assignRole",
+    "member.exitApprove",
+    "governance.record",
+    "governance.apply",
+    "constitution.propose",
+    "assistant.ask",
+  ],
+
+  // BR-10. The Platform Administrator provisions and suspends clubs and can
+  // see aggregate platform figures. This role holds NO club-level permission
+  // whatsoever — it is a custodian of the platform, not of anybody's money.
+  // The separation is deliberate and it is the one an assessor is most likely
+  // to probe.
+  PlatformAdmin: ["platform.view", "platform.provision", "platform.suspend"],
+};
+
+for (const role of ["Member", "Treasurer", "Secretary", "Chairperson"]) {
+  MATRIX[role].push("beneficiary.manage", "exit.notice");
+}
+MATRIX.Treasurer.push("exit.assess");
+MATRIX.Chairperson.push("exit.configure", "announcement.publish");
+MATRIX.Secretary.push("announcement.publish");
+
+for (const role of ['Member','Treasurer','Secretary','Chairperson']) MATRIX[role].push('notification.view');
+MATRIX.Secretary.push('notification.send');
+
+const ALL_ACTIONS = [...new Set(Object.values(MATRIX).flat())].sort();
+
+/**
+ * @param {string|null} role
+ * @param {string} action
+ * @returns {boolean}
+ */
+function can(role, action) {
+  if (!role) return false;
+  const allowed = MATRIX[role];
+  if (!allowed) return false;
+  return allowed.includes(action);
+}
+
+/**
+ * The sentence shown to the user and written to the audit log when an
+ * operation is refused. It names the role and says what would be required,
+ * because "permission denied" tells a treasurer nothing they can act on.
+ */
+function refusalReason(role, action) {
+  if (role === "PlatformAdmin") {
+    return (
+      "The Platform Administrator is a custodian of the platform, not of the " +
+      "money. This role has no access to club-level records (BR-10)."
+    );
+  }
+  if (!role) {
+    return "You have no role in this club.";
+  }
+  const holders = Object.entries(MATRIX)
+    .filter(([r, actions]) => r !== "PlatformAdmin" && actions.includes(action))
+    .map(([r]) => r);
+
+  if (holders.length === 0) {
+    return `Your role in this club is ${role}. This operation is not available.`;
+  }
+  const list =
+    holders.length === 1
+      ? `the ${holders[0]}`
+      : `the ${holders.slice(0, -1).join(", the ")} or the ${holders[holders.length - 1]}`;
+
+  return `Your role in this club is ${role}. This operation is reserved for ${list}.`;
+}
+
+module.exports = { MATRIX, ALL_ACTIONS, can, refusalReason };
